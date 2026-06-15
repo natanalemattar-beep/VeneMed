@@ -1,4 +1,4 @@
-// VeneMed - Sistema de Salud Soberano v2.1
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const express = require('express');
 const { Pool } = require('pg');
 const crypto = require('crypto');
@@ -18,41 +18,46 @@ const pool = new Pool({
 });
 
 async function initDB() {
-  const client = await pool.connect();
   try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS pacientes (
-        id SERIAL PRIMARY KEY,
-        nombre TEXT NOT NULL,
-        apellido TEXT NOT NULL,
-        cedula TEXT UNIQUE NOT NULL,
-        fecha_nacimiento TEXT,
-        direccion TEXT,
-        telefono TEXT,
-        email TEXT,
-        historial_medico TEXT,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS recetas (
-        id SERIAL PRIMARY KEY,
-        paciente_id INTEGER NOT NULL REFERENCES pacientes(id) ON DELETE CASCADE,
-        medicamento TEXT NOT NULL,
-        dosis TEXT NOT NULL,
-        frecuencia TEXT NOT NULL,
-        duracion TEXT,
-        fecha_emision TIMESTAMPTZ DEFAULT NOW(),
-        doctor TEXT,
-        notas TEXT,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-    console.log('Base de datos inicializada correctamente');
-  } finally {
-    client.release();
+    const client = await pool.connect();
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS pacientes (
+          id SERIAL PRIMARY KEY,
+          nombre TEXT NOT NULL,
+          apellido TEXT NOT NULL,
+          cedula TEXT UNIQUE NOT NULL,
+          fecha_nacimiento TEXT,
+          direccion TEXT,
+          telefono TEXT,
+          email TEXT,
+          historial_medico TEXT,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+      `);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS recetas (
+          id SERIAL PRIMARY KEY,
+          paciente_id INTEGER NOT NULL REFERENCES pacientes(id) ON DELETE CASCADE,
+          medicamento TEXT NOT NULL,
+          dosis TEXT NOT NULL,
+          frecuencia TEXT NOT NULL,
+          duracion TEXT,
+          fecha_emision TIMESTAMPTZ DEFAULT NOW(),
+          doctor TEXT,
+          notas TEXT,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+      `);
+      console.log('Base de datos inicializada correctamente');
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Error crítico en initDB:', err.message);
+    // En Vercel no queremos que el proceso muera, solo loguear el error
   }
 }
 
