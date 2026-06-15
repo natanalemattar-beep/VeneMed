@@ -1,52 +1,58 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const crypto = require('crypto');
 const path = require('path');
+require('dotenv').config();
 
 const app = express();
 const PORT = 3000;
-const DB_PATH = path.join(__dirname, 'database.db');
-const TOKEN_SECRET = 'veneMedSecret2026';
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname)));
 
-const db = new sqlite3.Database(DB_PATH, (err) => {
-  if (err) return console.error('Error al conectar DB:', err.message);
-  console.log('Conectado a SQLite');
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_URL_NON_POOLING,
 });
 
-db.run(`CREATE TABLE IF NOT EXISTS pacientes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  nombre TEXT NOT NULL,
-  apellido TEXT NOT NULL,
-  cedula TEXT UNIQUE NOT NULL,
-  fecha_nacimiento TEXT,
-  direccion TEXT,
-  telefono TEXT,
-  email TEXT,
-  historial_medico TEXT,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-)`);
-
-db.run(`CREATE TABLE IF NOT EXISTS recetas (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  paciente_id INTEGER NOT NULL,
-  medicamento TEXT NOT NULL,
-  dosis TEXT NOT NULL,
-  frecuencia TEXT NOT NULL,
-  duracion TEXT,
-  fecha_emision DATETIME DEFAULT CURRENT_TIMESTAMP,
-  doctor TEXT,
-  notas TEXT,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (paciente_id) REFERENCES pacientes(id) ON DELETE CASCADE
-)`);
-
-function generarToken() {
-  return crypto.randomBytes(20).toString('hex');
+async function initDB() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pacientes (
+        id SERIAL PRIMARY KEY,
+        nombre TEXT NOT NULL,
+        apellido TEXT NOT NULL,
+        cedula TEXT UNIQUE NOT NULL,
+        fecha_nacimiento TEXT,
+        direccion TEXT,
+        telefono TEXT,
+        email TEXT,
+        historial_medico TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS recetas (
+        id SERIAL PRIMARY KEY,
+        paciente_id INTEGER NOT NULL REFERENCES pacientes(id) ON DELETE CASCADE,
+        medicamento TEXT NOT NULL,
+        dosis TEXT NOT NULL,
+        frecuencia TEXT NOT NULL,
+        duracion TEXT,
+        fecha_emision TIMESTAMPTZ DEFAULT NOW(),
+        doctor TEXT,
+        notas TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    console.log('Base de datos inicializada correctamente');
+  } finally {
+    client.release();
+  }
 }
 
 let tokenValido = null;
@@ -63,7 +69,7 @@ function authMiddleware(req, res, next) {
 app.post('/auth/login', (req, res) => {
   const { usuario, clave } = req.body;
   if (usuario === 'admin' && clave === 'admin123') {
-    tokenValido = generarToken();
+    tokenValido = crypto.randomBytes(20).toString('hex');
     return res.json({ token: tokenValido, mensaje: 'Autenticación exitosa' });
   }
   res.status(401).json({ error: 'Credenciales inválidas' });
@@ -74,110 +80,143 @@ app.post('/auth/logout', (req, res) => {
   res.json({ mensaje: 'Sesión cerrada' });
 });
 
-app.get('/pacientes', authMiddleware, (req, res) => {
-  db.all('SELECT * FROM pacientes ORDER BY created_at DESC', [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+app.get('/pacientes', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM pacientes ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get('/pacientes/:id', authMiddleware, (req, res) => {
-  db.get('SELECT * FROM pacientes WHERE id = ?', [req.params.id], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ error: 'Paciente no encontrado' });
-    res.json(row);
-  });
+app.get('/pacientes/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM pacientes WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/pacientes', authMiddleware, (req, res) => {
+app.post('/pacientes', authMiddleware, async (req, res) => {
   const { nombre, apellido, cedula, fecha_nacimiento, direccion, telefono, email, historial_medico } = req.body;
   if (!nombre || !apellido || !cedula) {
     return res.status(400).json({ error: 'nombre, apellido y cedula son obligatorios' });
   }
-  db.run(
-    `INSERT INTO pacientes (nombre, apellido, cedula, fecha_nacimiento, direccion, telefono, email, historial_medico)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [nombre, apellido, cedula, fecha_nacimiento || null, direccion || null, telefono || null, email || null, historial_medico || null],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.status(201).json({ id: this.lastID, mensaje: 'Paciente creado' });
-    }
-  );
+  try {
+    const result = await pool.query(
+      `INSERT INTO pacientes (nombre, apellido, cedula, fecha_nacimiento, direccion, telefono, email, historial_medico)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [nombre, apellido, cedula, fecha_nacimiento || null, direccion || null, telefono || null, email || null, historial_medico || null]
+    );
+    res.status(201).json({ id: result.rows[0].id, mensaje: 'Paciente creado' });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: 'La cédula ya existe' });
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.put('/pacientes/:id', authMiddleware, (req, res) => {
+app.put('/pacientes/:id', authMiddleware, async (req, res) => {
   const { nombre, apellido, cedula, fecha_nacimiento, direccion, telefono, email, historial_medico } = req.body;
-  db.run(
-    `UPDATE pacientes SET nombre=?, apellido=?, cedula=?, fecha_nacimiento=?, direccion=?, telefono=?, email=?, historial_medico=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-    [nombre, apellido, cedula, fecha_nacimiento, direccion, telefono, email, historial_medico, req.params.id],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      if (this.changes === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
-      res.json({ mensaje: 'Paciente actualizado' });
-    }
-  );
+  try {
+    const result = await pool.query(
+      `UPDATE pacientes SET nombre=$1, apellido=$2, cedula=$3, fecha_nacimiento=$4, direccion=$5, telefono=$6, email=$7, historial_medico=$8, updated_at=NOW() WHERE id=$9 RETURNING id`,
+      [nombre, apellido, cedula, fecha_nacimiento, direccion, telefono, email, historial_medico, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
+    res.json({ mensaje: 'Paciente actualizado' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.delete('/pacientes/:id', authMiddleware, (req, res) => {
-  db.run('DELETE FROM pacientes WHERE id = ?', [req.params.id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    if (this.changes === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
+app.delete('/pacientes/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM pacientes WHERE id = $1 RETURNING id', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
     res.json({ mensaje: 'Paciente eliminado' });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get('/pacientes/:id/recetas', authMiddleware, (req, res) => {
-  db.all('SELECT * FROM recetas WHERE paciente_id = ? ORDER BY fecha_emision DESC', [req.params.id], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+app.get('/pacientes/:id/recetas', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM recetas WHERE paciente_id = $1 ORDER BY fecha_emision DESC',
+      [req.params.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/recetas', authMiddleware, (req, res) => {
-  const { paciente_id, medicamento, dosis, frecuencia, duracion, doctor, notas } = req.body;
+app.post('/recetas', authMiddleware, async (req, res) => {
+  const { paciente_id, medicamento, dosis, frequencia, duracion, doctor, notas } = req.body;
+  const frecuencia = req.body.frecuencia || frequencia;
   if (!paciente_id || !medicamento || !dosis || !frecuencia) {
     return res.status(400).json({ error: 'paciente_id, medicamento, dosis y frecuencia son obligatorios' });
   }
-  db.get('SELECT id FROM pacientes WHERE id = ?', [paciente_id], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ error: 'Paciente no encontrado' });
-    db.run(
+  try {
+    const p = await pool.query('SELECT id FROM pacientes WHERE id = $1', [paciente_id]);
+    if (p.rows.length === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
+    const result = await pool.query(
       `INSERT INTO recetas (paciente_id, medicamento, dosis, frecuencia, duracion, doctor, notas)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [paciente_id, medicamento, dosis, frecuencia, duracion || null, doctor || null, notas || null],
-      function (err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.status(201).json({ id: this.lastID, mensaje: 'Receta creada' });
-      }
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [paciente_id, medicamento, dosis, frecuencia, duracion || null, doctor || null, notas || null]
     );
-  });
+    res.status(201).json({ id: result.rows[0].id, mensaje: 'Receta creada' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.put('/recetas/:id', authMiddleware, (req, res) => {
-  const { medicamento, dosis, frecuencia, duracion, doctor, notas } = req.body;
-  db.run(
-    `UPDATE recetas SET medicamento=?, dosis=?, frecuencia=?, duracion=?, doctor=?, notas=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-    [medicamento, dosis, frecuencia, duracion, doctor, notas, req.params.id],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      if (this.changes === 0) return res.status(404).json({ error: 'Receta no encontrada' });
-      res.json({ mensaje: 'Receta actualizada' });
-    }
-  );
+app.put('/recetas/:id', authMiddleware, async (req, res) => {
+  const { medicamento, dosis, frequencia, duracion, doctor, notas } = req.body;
+  const frecuencia = req.body.frecuencia || frequencia;
+  try {
+    const result = await pool.query(
+      `UPDATE recetas SET medicamento=$1, dosis=$2, frecuencia=$3, duracion=$4, doctor=$5, notas=$6, updated_at=NOW() WHERE id=$7 RETURNING id`,
+      [medicamento, dosis, frecuencia, duracion, doctor, notas, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Receta no encontrada' });
+    res.json({ mensaje: 'Receta actualizada' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.delete('/recetas/:id', authMiddleware, (req, res) => {
-  db.run('DELETE FROM recetas WHERE id = ?', [req.params.id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    if (this.changes === 0) return res.status(404).json({ error: 'Receta no encontrada' });
+app.get('/recetas/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM recetas WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Receta no encontrada' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/recetas/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM recetas WHERE id = $1 RETURNING id', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Receta no encontrada' });
     res.json({ mensaje: 'Receta eliminada' });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`VeneMed corriendo en http://localhost:${PORT}`);
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`VeneMed corriendo en http://localhost:${PORT} (Supabase)`);
+  });
+}).catch(err => {
+  console.error('Error inicializando DB:', err.message);
+  process.exit(1);
 });
